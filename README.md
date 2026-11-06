@@ -135,7 +135,7 @@ Validation in the API returns clear 4xx messages, but the schema repeats the imp
 
 ## Demo video
 
-Demo video (3 minutes or less): _link to be added before submission_
+[Watch SplitNest Demo](https://drive.google.com/file/d/1_XLDIfdCTPBsRglgpHp-j79To-6-rKae/view?usp=sharing) (about 2 minutes 44 seconds)
 
 The app is only run locally (`pnpm dev`). It is not deployed anywhere.
 
