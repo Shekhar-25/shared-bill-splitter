@@ -1,3 +1,159 @@
+# SplitNest
+
+> Shared living. Smarter splitting.
+
+SplitNest is a shared-expense app for a household. Create a home, add its members, split a bill between them to the cent, and let each member pay their own share. It is the solution to the assignment that is reproduced in full further down in this file.
+
+**Payments are simulated.** Paying a share only records `paidAt` in the database. There is no payment gateway and no money moves. The UI says so on the payment confirmation.
+
+## Features
+
+- Create homes and add members; members keep their creation order.
+- Create a bill from a dollar amount. The UI converts it to integer cents, previews each member's share with the same function the API uses, then saves the bill and its shares in one transaction.
+- Bill details with per-member share, paid/outstanding badge and payment date.
+- Pay a share with a confirmation dialog, a stable `Idempotency-Key`, double-click protection, and an error that leaves the share unpaid.
+- Dashboard (outstanding total, bills, members, recent bills, who owes what) and a balances page with per-member progress.
+- Skeleton loading, a "taking longer than usual" hint, empty states, error states with retry (including 404 and 500), validation messages, toasts and a responsive layout with a mobile navigation drawer.
+
+## Technology stack
+
+| Area     | Tools                                                           |
+| -------- | --------------------------------------------------------------- |
+| API      | TypeScript, Hono, Cloudflare Workers                            |
+| Database | Cloudflare D1 (SQLite), SQL migrations in `api/migrations`      |
+| Web      | React 19, Vite, TypeScript, TanStack Router (file-based routes) |
+| Tests    | Vitest in the Workers runtime (`@cloudflare/vitest-plugin`)     |
+| Quality  | Biome, `tsc --noEmit` in strict mode                            |
+
+No other runtime dependencies were added. Icons are small inline SVGs, styling is one plain CSS file with design tokens, and validation is hand-written (a few small functions).
+
+## Architecture
+
+```text
+Browser (React + TanStack Router)
+   │  fetch /api/...   (Vite proxies /api to :8787 in development)
+   ▼
+Hono app on a Cloudflare Worker  ── routes → validation → SQL (D1 binding `DB`)
+   ▼
+D1 / SQLite  (constraints protect the data even if the API has a bug)
+```
+
+- **API** (`api/src`): thin routes that validate input, run SQL, and throw `HttpError`. One `onError` handler turns every error into `{ "error": "message" }`, so unknown errors become a JSON 500 and unknown routes a JSON 404.
+- **Web** (`web/src`): `lib/api.ts` is the only code that calls `fetch`; it parses every response instead of trusting its shape. `hooks/useResource.ts` gives each page loading/error/success state. Pages are small and use shared components from `components/`.
+- **Shared code**: `api/src/split.ts` is a pure function imported by both the API and the web app, so the bill preview can never disagree with the saved split.
+
+## Project structure
+
+```text
+api/
+  migrations/0001_init.sql     schema and constraints
+  src/index.ts                 app, JSON error and 404 handlers
+  src/routes/homes.ts          homes, members, balances
+  src/routes/bills.ts          bills, shares, payments
+  src/split.ts                 integer bill splitting (shared with web)
+  src/validation.ts            body, amount and header validation
+  src/errors.ts                HttpError
+  test/                        original tests + edge-cases.test.ts
+web/
+  src/routes/                  one file per page (file-based routing)
+  src/components/              app shell, UI kit, dialogs, icons
+  src/context/                 current home, homes list, toasts
+  src/hooks/                   useResource and data hooks
+  src/lib/                     api client, money helpers, idempotency keys, summaries
+  src/styles.css               design tokens and styles
+```
+
+## Database schema
+
+All money columns are integer cents. Foreign keys are enforced by D1.
+
+| Table     | Purpose                                                             | Named constraints                                                                                                                                                        |
+| --------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `homes`   | A household                                                         | `homes_name_not_blank` (CHECK)                                                                                                                                           |
+| `members` | People in a home; `seq` (AUTOINCREMENT) is the creation order       | `members_id_unique` (UNIQUE), `members_home_fk` (FOREIGN KEY), `members_name_not_blank` (CHECK)                                                                          |
+| `bills`   | A bill for a home                                                   | `bills_home_fk`, `bills_total_positive` (CHECK integer and > 0), `bills_title_not_blank`                                                                                 |
+| `shares`  | One member's part of a bill, `paid_at` and the paying `payment_key` | `shares_bill_fk`, `shares_member_fk`, `shares_amount_non_negative` (CHECK integer and >= 0), `shares_one_per_member` (UNIQUE bill + member), `shares_paid_state` (CHECK) |
+
+What the important ones stop:
+
+- `bills_total_positive` stops zero, negative and non-integer totals even if the API check is bypassed.
+- `shares_one_per_member` stops a member getting two shares of one bill.
+- `shares_paid_state` makes `(paid_at IS NULL) = (payment_key IS NULL)`, so a share is either unpaid or fully paid with a key. It can never be half paid.
+- The foreign keys stop members, bills and shares that point at something that does not exist, and cascade deletes cleanly.
+
+## API
+
+Every error is `{ "error": "message" }`.
+
+| Method and path                                                   | Success                                           | Errors                                                        |
+| ----------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------- |
+| `POST /api/homes` `{ name }`                                      | 201 `{ id, name }`                                | 400 bad JSON, 422 bad name                                    |
+| `POST /api/homes/:homeId/members` `{ name }`                      | 201 `{ id, homeId, name }`                        | 404 home, 400, 422                                            |
+| `POST /api/homes/:homeId/bills` `{ title, totalCents }`           | 201 `{ id, homeId, title, totalCents, shares[] }` | 404 home, 422 bad amount / no members / bad title, 400        |
+| `POST /api/bills/:billId/shares/:shareId/pay` + `Idempotency-Key` | 200 `{ id, memberId, amountCents, paidAt }`       | 400 key missing, 404 bill or share, 409 paid with another key |
+| `GET /api/homes/:homeId/balances`                                 | 200 `{ balances[] }` in member order              | 404 home                                                      |
+| `GET /api/health`                                                 | 200 `{ status: "ok" }`                            |                                                               |
+
+Extra read endpoints used by the web app: `GET /api/homes`, `GET /api/homes/:homeId` (with members), `GET /api/homes/:homeId/bills`, `GET /api/bills/:billId`.
+
+## Setup and development
+
+You need Node 20+ and pnpm. If `pnpm` is not installed, `npx pnpm@10 <command>` works too.
+
+```bash
+pnpm install
+pnpm dev          # api on http://localhost:8787, web on http://localhost:5173
+```
+
+`pnpm dev` applies the migrations to a local D1 database first. Open http://localhost:5173.
+
+## Testing and quality
+
+```bash
+pnpm test         # 4 files: the 3 original files + api/test/edge-cases.test.ts
+pnpm check        # Biome
+pnpm typecheck    # tsc in both packages
+pnpm build        # production build of the web app
+```
+
+`api/test/edge-cases.test.ts` adds tests for splitting (even, uneven, one member, fewer cents than members), invalid bodies and amounts, missing home/bill/share, missing or blank `Idempotency-Key`, repeated payments with the same and with a different key, 10 simultaneous payments, balances over several bills and homes, and direct tests of the database constraints. The original tests and `api/test/helpers.ts` are unchanged.
+
+## Decisions
+
+**1. Money is integer cents, and the split uses integer maths only.**
+The API accepts `totalCents` only if it is a JSON number that is a safe positive integer (strings, decimals, zero and negatives get 422; there is also an upper bound so sums stay exact). `splitCents` gives everyone `floor(total / n)` and gives one extra cent to each of the first `total % n` members, so 1000 between 3 is `334, 333, 333` and the shares always sum to the total. "First" is defined by `members.seq`, an auto-increment column, so the order is a fact stored in the database and not an accident of query order. The web app never uses floats for money either: `parseAmountToCents` reads the digits of the typed string, and amounts are formatted from integers. Because the web app imports the very same `splitCents`, the preview cannot drift from what the API saves.
+
+**2. Payment idempotency and concurrency are decided by one SQL statement, not by JavaScript state.**
+The paying key is stored on the share (`payment_key`, with `paid_at`). Paying runs:
+`UPDATE shares SET paid_at = ?, payment_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL`.
+SQLite runs write statements one after another, so if several requests race for the same share exactly one finds `paid_at IS NULL` and updates the row; the others change zero rows. After the update the handler reads the stored row: if its `payment_key` equals the request's key, the answer is `200` with the stored result (this covers a retry and also the winner itself); if it is different, the answer is `409`. There is no in-memory state, so this also holds across Worker isolates. A key only has meaning for one share, which is why it can live on the share row instead of in a separate table. The test with 10 simultaneous different-key requests expects exactly one `200` and nine `409`, and the test with 10 simultaneous same-key requests expects ten identical `200` answers. In the browser, one key is created per payment attempt (`web/src/lib/idempotency.ts`) and reused for automatic retries (network error, timeout, 5xx) and for the "Try again" button. It is dropped only when the server gives a final answer.
+
+**3. The database enforces the rules, the API only gives friendly errors.**
+Validation in the API returns clear 4xx messages, but the schema repeats the important rules as named constraints: positive integer totals, non-negative integer shares, one share per member per bill, the paid-state check, and foreign keys (D1 enforces them). A bug or a direct write cannot create a negative bill or a half-paid share; the tests exercise these constraints directly. A bill and all its shares are inserted with `db.batch`, which is one transaction, so a bill never exists without its shares.
+
+**Other choices.** There is no state library: a small `useResource` hook is enough for loading/error/success. The UI only changes a share to "paid" after the server answers 200 and the bill is reloaded. Response bodies are parsed with small type guards instead of casts.
+
+## Demo video
+
+Demo video (3 minutes or less): _link to be added before submission_
+
+The app is only run locally (`pnpm dev`). It is not deployed anywhere.
+
+## Known limitations
+
+- There is no authentication, so anyone can pay any share. The assignment says "a member pays their share" and has no users.
+- Members cannot be removed or renamed, and bills cannot be edited or deleted (not required).
+- A bill splits between the members present when it is created. A member added later owes nothing for older bills.
+- If a member were added in the few milliseconds between reading the members and inserting the shares, that member would be missing from that one bill. Fixing it needs a single `INSERT ... SELECT` and was left out to keep the code readable.
+- The currency symbol is `$` and is not configurable.
+- The Manrope font is loaded from Google Fonts; offline it falls back to a system font.
+
+## AI assistance disclosure
+
+This project was built with **Claude Code (Claude Sonnet 5.5, Anthropic)** running in the Claude desktop app. It was used to inspect the starter repository and the tests, write the migration, API, tests and web app, run the test/lint/type/build commands, and exercise the app in a browser. The submitter is expected to review the code and be able to explain every part of it.
+
+---
+
 # SDE Intern Assignment: Shared Bill Splitter
 
 Welcome. In this assignment you build a small bill splitter for a shared home. It has two parts:
